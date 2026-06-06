@@ -44,6 +44,8 @@ venv.bak/
 
 # Claude Code
 .claude/
+!.claude/settings.json
+!.claude/audit.jsonl
 
 # Project specific outputs
 outputs/
