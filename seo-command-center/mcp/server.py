@@ -87,49 +87,31 @@ def _report_obj() -> dict:
 
 def seo_set_fixes(titles=None, redirect_map=None) -> dict:
     RUN["fixes"] = {"titles": titles or [], "redirect_map": redirect_map or []}
-    _emit("fixes", RUN["fixes"]); return {"titles": len(titles or []), "redirects": len(redirect_map or [])}
+    _emit("fixes", RUN["fixes"])
+    return {"titles": len(titles or []), "redirects": len(redirect_map or [])}
 
 
 def seo_recommend(recommendations: list) -> dict:
     RUN["recommendations"] = recommendations
-    _emit("recommendations", {"recommendations": recommendations}); return {"count": len(recommendations)}
+    _emit("recommendations", {"recommendations": recommendations})
+    return {"count": len(recommendations)}
 
 
 def seo_generate_fixes() -> dict:
+    """Generate deterministic title rewrites and redirect suggestions.
+    No LLM calls — fully offline, instant, schema-valid output."""
     rows = RUN.get("rows", [])
     issues = RUN.get("issues", [])
     if not rows or not issues:
         return {"error": "No data loaded or no issues detected."}
 
     RUN["status"] = "fixing"
-    titles, redirects = [], []
-    model_calls = 0
+    _emit("stage", {"stage": "fixing", "msg": "Generating fix suggestions…"})
 
-    # Optimization: build a lookup map for rows
-    url_map = {r["Address"]: r for r in rows}
-
-    for i in issues:
-        itype = i["type"]
-        for url in i["affected_urls"]:
-            row = url_map.get(url, {})
-            if itype in ("missing_title", "duplicate_title", "title_too_long"):
-                new_t = fixer.generate_title(url, row.get("Title 1", ""), "")
-                titles.append({"url": url, "old": row.get("Title 1", ""), "new": new_t})
-                model_calls += 1
-            elif itype in ("missing_meta_description", "duplicate_meta_description", "meta_description_too_long"):
-                new_m = fixer.generate_meta(url, row.get("Meta Description 1", ""), row.get("Title 1", ""))
-                # Note: we reuse 'titles' list for both or store them in a separate map
-                # To keep it simple for the CSV, we'll track titles and metas separately in the report
-                # But for the CSV, we need a combined view.
-                # Let's just add to a general fixes list.
-                pass
-            elif itype == "broken_link":
-                target = fixer.suggest_redirect(url, list(url_map.keys()))
-                redirects.append({"from": url, "to": target, "reason": "AI Suggested"})
-                model_calls += 1
+    titles, redirects = fixer.generate_fixes(issues, rows)
 
     RUN["fixes"] = {"titles": titles, "redirect_map": redirects}
-    RUN["model_calls"] = model_calls
+    RUN["model_calls"] = 0  # deterministic — no model calls
     _emit("fixes", RUN["fixes"])
     return {"titles": len(titles), "redirects": len(redirects)}
 
@@ -139,16 +121,30 @@ def seo_report() -> dict:
     data = _report_obj()
 
     if jsonschema:
-        try:
-            schema_path = os.path.join(ROOT, "..", "report.schema.json")
-            with open(schema_path, "r") as f:
-                schema = json.load(f)
-            jsonschema.validate(instance=data, schema=schema)
-        except Exception as e:
-            print(f"[seo] Schema validation error: {e}")
+        # Search for schema in multiple locations (works for any CWD)
+        schema_candidates = [
+            os.path.join(ROOT, "..", "report.schema.json"),
+            os.path.join(ROOT, "report.schema.json"),
+            os.path.join(os.getcwd(), "report.schema.json"),
+        ]
+        schema_path = next((p for p in schema_candidates if os.path.exists(p)), None)
+        if schema_path:
+            try:
+                with open(schema_path, "r", encoding="utf-8") as f:
+                    schema = json.load(f)
+                jsonschema.validate(instance=data, schema=schema)
+                print("[seo] report.json schema validation: PASSED ✓", flush=True)
+            except jsonschema.ValidationError as e:
+                print(f"[seo] Schema validation FAILED: {e.message}", flush=True)
+            except Exception as e:
+                print(f"[seo] Schema validation error: {e}", flush=True)
+        else:
+            print("[seo] Schema file not found — skipping validation", flush=True)
 
     json.dump(data, open(p, "w", encoding="utf-8"), indent=2)
-    RUN["status"] = "done"; _emit("saved", {"path": p}); return {"path": p}
+    RUN["status"] = "done"
+    _emit("saved", {"path": p})
+    return {"path": p}
 
 def seo_export() -> dict:
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -176,33 +172,132 @@ def seo_export() -> dict:
     _emit("exported", {"path": p_html}); return {"path": p_html}
 
 
-def _render_html(o) -> str:
+def _render_html(o) -> str:  # noqa: C901
+    """Render a client-ready HTML report with issues, fixes, and redirect map."""
     sev = (o["summary"] or {}).get("by_severity", {})
-    rows = "".join(
-        f'<tr><td><span class="sev {i["severity"].lower()}">{i["severity"]}</span></td>'
-        f'<td>{i["type"]}</td><td>{i["count"]}</td>'
-        f'<td>{(i.get("explanation") or "")}</td></tr>'
-        for i in sorted(o["issues"], key=lambda x: {"High":0,"Medium":1,"Low":2}.get(x["severity"],3)))
-    recs = "".join(f"<li>{r}</li>" for r in o.get("recommendations", []))
-    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>SEO Audit — {o['site']}</title>
-<style>body{{font-family:Inter,system-ui,sans-serif;background:#1a1a1f;color:#f8f7f4;margin:0;padding:40px;line-height:1.5}}
-.wrap{{max-width:860px;margin:0 auto}}h1{{font-size:28px;margin:0 0 4px}}.sub{{color:#c8c5be;margin-bottom:24px}}
-.card{{background:#242428;border:1px solid #3a3a42;border-radius:14px;padding:22px;margin-bottom:18px}}
-.k{{display:flex;gap:24px;flex-wrap:wrap}}.k div{{font-size:13px;color:#c8c5be}}.k b{{display:block;font-size:30px;color:#f8f7f4}}
-table{{width:100%;border-collapse:collapse;font-size:13.5px}}th,td{{text-align:left;padding:9px 10px;border-bottom:1px solid #3a3a42}}
-th{{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#c8c5be}}
-.sev{{font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px}}.sev.high{{background:#FF0000;color:#fff}}
-.sev.medium{{background:#e2b53e;color:#1a1a1f}}.sev.low{{background:#3a3a42;color:#c8c5be}}
-ul{{padding-left:20px}}li{{margin:6px 0}}.muted{{color:#c8c5be;font-size:13px}}</style></head><body><div class="wrap">
-<h1>SEO Audit Report</h1><div class="sub">{o['site']} · {o['urls_crawled']} URLs crawled</div>
-<div class="card k"><div><b>{(o['summary'] or {}).get('total_issues',0)}</b>total issues</div>
-<div><b style="color:#FF0000">{sev.get('High',0)}</b>high</div><div><b style="color:#e2b53e">{sev.get('Medium',0)}</b>medium</div>
-<div><b>{sev.get('Low',0)}</b>low</div></div>
-<div class="card"><h3>Issues (prioritized)</h3><table><thead><tr><th>Severity</th><th>Issue</th><th>URLs</th><th>What it means</th></tr></thead>
-<tbody>{rows or '<tr><td colspan=4 class=muted>No issues detected.</td></tr>'}</tbody></table></div>
-<div class="card"><h3>Recommendations</h3><ul>{recs or '<li class=muted>None generated.</li>'}</ul></div>
-<p class="muted">Generated by SEO Command Center · model {o.get('run_meta',{}).get('model','')}</p></div></body></html>"""
+    total = (o["summary"] or {}).get("total_issues", 0)
+    meta = o.get("run_meta", {})
+    fixes_titles = (o.get("fixes") or {}).get("titles", [])
+    fixes_redirects = (o.get("fixes") or {}).get("redirect_map", [])
+
+    issue_rows = "".join(
+        f'<tr>'
+        f'<td><span class="sev {i["severity"].lower()}">{i["severity"]}</span></td>'
+        f'<td><code>{i["type"]}</code></td>'
+        f'<td style="text-align:right;font-weight:600">{i["count"]}</td>'
+        f'<td style="color:#c8c5be">{(i.get("explanation") or "")}</td>'
+        f'</tr>'
+        for i in sorted(o["issues"], key=lambda x: {"High": 0, "Medium": 1, "Low": 2}.get(x["severity"], 3))
+    )
+
+    recs_html = "".join(
+        f'<li>{r}</li>' for r in o.get("recommendations", [])
+    ) or '<li class="muted">No recommendations generated.</li>'
+
+    title_rows = "".join(
+        f'<tr><td style="word-break:break-all;font-size:11px;color:#9ca3af">{fix["url"]}</td>'
+        f'<td style="color:#f87171;font-size:12px">{fix.get("old") or "<em>empty</em>"}</td>'
+        f'<td style="color:#4ade80;font-size:12px;font-weight:600">{fix["new"]}</td></tr>'
+        for fix in fixes_titles[:50]  # cap at 50 for readability
+    ) or '<tr><td colspan="3" class="muted">No title fixes generated.</td></tr>'
+
+    redirect_rows = "".join(
+        f'<tr><td style="word-break:break-all;font-size:11px;color:#f87171">{r["from"]}</td>'
+        f'<td style="word-break:break-all;font-size:11px;color:#4ade80">{r["to"]}</td>'
+        f'<td style="font-size:11px;color:#9ca3af">{r.get("reason","")}</td></tr>'
+        for r in fixes_redirects[:30]
+    ) or '<tr><td colspan="3" class="muted">No redirects generated.</td></tr>'
+
+    duration = meta.get("duration_sec", 0)
+    model_calls = meta.get("model_calls", 0)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="SEO audit report for {o['site']} — {total} issues detected across {o['urls_crawled']} URLs.">
+  <title>SEO Audit Report — {o['site']}</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:Inter,system-ui,sans-serif;background:#0f0f13;color:#f8f7f4;line-height:1.6;padding:0 0 60px}}
+    .topbar{{background:linear-gradient(135deg,#1a1a2e,#16213e);border-bottom:1px solid #2d2d3a;padding:20px 40px;display:flex;align-items:center;gap:16px}}
+    .topbar h1{{font-size:20px;font-weight:700;letter-spacing:-.3px}}
+    .dot{{width:10px;height:10px;border-radius:50%;background:#ef4444;display:inline-block;margin-right:8px}}
+    .wrap{{max-width:940px;margin:0 auto;padding:32px 24px}}
+    .kpi{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:24px}}
+    .kpi-card{{background:#1c1c24;border:1px solid #2d2d3a;border-radius:14px;padding:18px 20px}}
+    .kpi-card .val{{font-size:36px;font-weight:700;line-height:1}}
+    .kpi-card .lbl{{font-size:12px;color:#9ca3af;margin-top:4px}}
+    .high-val{{color:#ef4444}}.medium-val{{color:#f59e0b}}.low-val{{color:#6b7280}}.ok-val{{color:#4ade80}}
+    .meta-row{{display:flex;gap:20px;flex-wrap:wrap;font-size:12.5px;color:#6b7280;margin-bottom:24px}}
+    .meta-row span{{background:#1c1c24;border:1px solid #2d2d3a;border-radius:6px;padding:4px 10px}}
+    .card{{background:#1c1c24;border:1px solid #2d2d3a;border-radius:14px;padding:22px;margin-bottom:18px}}
+    .card h2{{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:#6b7280;margin-bottom:16px;font-weight:600}}
+    table{{width:100%;border-collapse:collapse;font-size:13px}}
+    th,td{{text-align:left;padding:9px 12px;border-bottom:1px solid #2d2d3a;vertical-align:top}}
+    th{{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:#6b7280;font-weight:600}}
+    .sev{{font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;white-space:nowrap}}
+    .sev.high{{background:#ef4444;color:#fff}}
+    .sev.medium{{background:#f59e0b;color:#000}}
+    .sev.low{{background:#374151;color:#9ca3af}}
+    code{{font-family:monospace;font-size:12px;color:#a78bfa;background:#1e1b4b;padding:1px 5px;border-radius:4px}}
+    ul{{padding-left:18px}}li{{margin:7px 0;font-size:13.5px}}
+    .muted{{color:#6b7280;font-size:12.5px}}
+    .footer{{text-align:center;color:#4b5563;font-size:12px;margin-top:36px}}
+  </style>
+</head>
+<body>
+<div class="topbar">
+  <span class="dot"></span>
+  <h1>SEO Audit Report</h1>
+  <span style="margin-left:auto;font-size:13px;color:#9ca3af">{o['site']} &nbsp;·&nbsp; {o['urls_crawled']} URLs crawled</span>
+</div>
+<div class="wrap">
+
+  <div class="kpi">
+    <div class="kpi-card"><div class="val">{total}</div><div class="lbl">Total issue types</div></div>
+    <div class="kpi-card"><div class="val high-val">{sev.get('High',0)}</div><div class="lbl">High severity</div></div>
+    <div class="kpi-card"><div class="val medium-val">{sev.get('Medium',0)}</div><div class="lbl">Medium severity</div></div>
+    <div class="kpi-card"><div class="val low-val">{sev.get('Low',0)}</div><div class="lbl">Low severity</div></div>
+    <div class="kpi-card"><div class="val ok-val">{len(fixes_titles)}</div><div class="lbl">Title fixes</div></div>
+    <div class="kpi-card"><div class="val ok-val">{len(fixes_redirects)}</div><div class="lbl">Redirects mapped</div></div>
+  </div>
+
+  <div class="meta-row">
+    <span>⏱ {duration}s audit time</span>
+    <span>🤖 {model_calls} model calls</span>
+    <span>🔧 Deterministic detection</span>
+  </div>
+
+  <div class="card">
+    <h2>Issues Found (prioritized by severity)</h2>
+    <table><thead><tr><th>Severity</th><th>Issue type</th><th style="text-align:right">URLs</th><th>What it means</th></tr></thead>
+    <tbody>{issue_rows or '<tr><td colspan="4" class="muted">No issues detected.</td></tr>'}</tbody></table>
+  </div>
+
+  <div class="card">
+    <h2>Recommendations</h2>
+    <ul>{recs_html}</ul>
+  </div>
+
+  <div class="card">
+    <h2>Title Fixes ({len(fixes_titles)} rewrites)</h2>
+    <table><thead><tr><th>URL</th><th>Current title</th><th>Suggested title</th></tr></thead>
+    <tbody>{title_rows}</tbody></table>
+    {f'<p class="muted" style="margin-top:10px">Showing first 50 of {len(fixes_titles)}.</p>' if len(fixes_titles) > 50 else ''}
+  </div>
+
+  <div class="card">
+    <h2>Redirect Map ({len(fixes_redirects)} suggestions)</h2>
+    <table><thead><tr><th>Broken URL</th><th>Suggested target</th><th>Reason</th></tr></thead>
+    <tbody>{redirect_rows}</tbody></table>
+  </div>
+
+  <div class="footer">Generated by SEO Command Center &nbsp;·&nbsp; model: {meta.get('model','deterministic')}</div>
+</div>
+</body></html>"""
 
 
 # ----- pipeline runner (same process as dashboard) -----
@@ -210,23 +305,50 @@ def _run_pipeline(export_dir: str):
     """Run the full audit pipeline in a background thread so SSE events reach the browser."""
     import time as _time
     try:
-        _emit("log", {"msg": f"Starting audit on {export_dir}…"})
         t0 = _time.time()
-        seo_load(export_dir)
-        seo_detect()
-        seo_set_fixes(titles=[], redirect_map=[])
 
-        issues = sorted(RUN["issues"], key=lambda x: {"High": 0, "Medium": 1, "Low": 2}.get(x["severity"], 3))
-        recs = [f"Fix the {i['count']} {i['severity']}-severity '{i['type']}' issue(s) first." for i in issues[:5]] or ["No issues detected."]
+        # Stage 1: Load
+        _emit("stage", {"stage": "loading", "msg": f"Loading CSV from {export_dir}…"})
+        _emit("log", {"msg": f"Stage 1/4 — Loading export from {export_dir}"})
+        seo_load(export_dir)
+        _emit("log", {"msg": f"Loaded {RUN['urls']} URLs from {RUN['site']}"})
+
+        # Stage 2: Detect
+        _emit("stage", {"stage": "detecting", "msg": "Running SEO rulebook detectors…"})
+        _emit("log", {"msg": "Stage 2/4 — Running 17 detection rules"})
+        seo_detect()
+        s = RUN["summary"]
+        _emit("log", {"msg": f"Detected {s['total_issues']} issue types (High:{s['by_severity'].get('High',0)} Medium:{s['by_severity'].get('Medium',0)} Low:{s['by_severity'].get('Low',0)})"})
+
+        # Stage 3: Generate fixes (deterministic)
+        _emit("stage", {"stage": "fixing", "msg": "Generating deterministic fixes…"})
+        _emit("log", {"msg": "Stage 3/4 — Generating title rewrites & redirect suggestions"})
+        seo_generate_fixes()
+        fx = RUN.get("fixes", {})
+        _emit("log", {"msg": f"Generated {len(fx.get('titles',[]))} title fixes, {len(fx.get('redirect_map',[]))} redirect suggestions"})
+
+        # Stage 4: Recommend + Report
+        _emit("stage", {"stage": "reporting", "msg": "Building recommendations & writing report…"})
+        _emit("log", {"msg": "Stage 4/4 — Writing report.json and report.html"})
+        issues_sorted = sorted(RUN["issues"], key=lambda x: {"High": 0, "Medium": 1, "Low": 2}.get(x["severity"], 3))
+        recs = [
+            f"[{i['severity']}] Fix {i['count']} '{i['type']}' URL(s) — {i.get('explanation','')}"
+            for i in issues_sorted[:8]
+        ] or ["No issues detected on this crawl."]
         seo_recommend(recs)
-        RUN["model_calls"] = 0
-        RUN["duration_sec"] = round(_time.time() - t0, 1)
+        RUN["duration_sec"] = round(_time.time() - t0, 2)
         seo_report()
         seo_export()
-        _emit("log", {"msg": f"Done in {RUN['duration_sec']}s — report.html written ✓"})
+
+        _emit("log", {"msg": f"✓ Done in {RUN['duration_sec']}s — report.html ready"})
+        _emit("stage", {"stage": "done", "msg": f"Completed in {RUN['duration_sec']}s"})
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
         _emit("log", {"msg": f"Error: {e}"})
+        _emit("stage", {"stage": "error", "msg": str(e)})
         RUN["status"] = "error"
+        print(f"[seo] Pipeline error: {tb}", flush=True)
 
 
 # ----- dashboard HTTP host -----
