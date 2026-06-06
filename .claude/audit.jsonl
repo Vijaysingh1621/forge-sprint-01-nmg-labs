@@ -1,1 +1,2 @@
 {"ts":"2026-06-06T07:41:38.3NZ","session_id":"test","hook":"unknown","tool":"","command":"","exit_code":"","output_preview":""}
+{"ts":"2026-06-06T10:11:07.3NZ","session_id":"verify-123","hook":"unknown","tool":"Bash","command":"ls","exit_code":"0","output_preview":"files..."}
